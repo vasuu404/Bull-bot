@@ -1,3 +1,4 @@
+cat > /mnt/user-data/outputs/bull-bot/bot.js << 'BULLBOT_EOF'
 require('dotenv').config();
 const {
   Client,
@@ -31,15 +32,159 @@ const MAX_WARNINGS = 3;
 
 const BAD_WORDS = ['badword1', 'badword2']; // add words you want auto-filtered, lowercase only
 const spamTracker = new Collection(); // userId -> [timestamps]
-const SPAM_LIMIT = 5; // messages
-const SPAM_WINDOW_MS = 7000; // within this many ms counts as spam
+const SPAM_LIMIT = 5;
+const SPAM_WINDOW_MS = 7000;
 
 const seenNewsUrls = new Set();
 const NEWS_INTERVAL_MINUTES = parseInt(process.env.NEWS_INTERVAL_MINUTES) || 60;
 
-// ---------- GIVEAWAY + SPIN + CLAIM STATE (one active giveaway at a time) ----------
-let currentGiveaway = null; // { prize, participants: Set, excluded: Set, channelId, messageId, entryTimeoutHandle }
-let currentClaim = null; // { winnerId, prize, resolved, resolveTimeoutHandle, channelId }
+// =========================================================
+// NORMAL GIVEAWAY (independent, plain winner announcement)
+// =========================================================
+let normalGiveaway = null; // { prize, imageUrl, participants: Set, channelId, timeoutHandle }
+
+async function startNormalGiveaway(channel, prize, seconds, imageUrl) {
+  if (normalGiveaway) {
+    return channel.send('A normal giveaway is already running — wait for it to finish first.');
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(0xffb020)
+    .setTitle('🎉 Giveaway!')
+    .setDescription(`**Prize:** ${prize}\n**Entries close in:** ${seconds} second(s)\n\nClick the button below to enter!`);
+  if (imageUrl) embed.setImage(imageUrl);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('giveaway_join').setLabel('🎉 Join').setStyle(ButtonStyle.Success)
+  );
+
+  await channel.send({ embeds: [embed], components: [row] });
+
+  normalGiveaway = { prize, imageUrl, participants: new Set(), channelId: channel.id };
+  normalGiveaway.timeoutHandle = setTimeout(() => endNormalGiveaway(channel), seconds * 1000);
+}
+
+async function endNormalGiveaway(channel) {
+  if (!normalGiveaway) return;
+  const { prize, participants } = normalGiveaway;
+  normalGiveaway = null;
+
+  const pool = Array.from(participants);
+  if (pool.length === 0) {
+    return channel.send(`The giveaway for **${prize}** ended but nobody entered 🥲`);
+  }
+  const winnerId = pool[Math.floor(Math.random() * pool.length)];
+  return channel.send(`🎉 Congrats <@${winnerId}>! You won **${prize}**!`);
+}
+
+// =========================================================
+// SPIN SYSTEM (fully separate — countdown, entries, shuffle,
+// claim with 1-min timer, auto-restart loop on decline/timeout)
+// =========================================================
+let spinConfig = null; // { prize, entrySeconds, spinRounds, imageUrl, channelId, active }
+let spinParticipants = new Set();
+let spinClaim = null; // { winnerId, resolved, timeoutHandle }
+let spinEntryTimeoutHandle = null;
+
+async function stopSpin(channel) {
+  spinConfig = null;
+  spinParticipants = new Set();
+  if (spinClaim && spinClaim.timeoutHandle) clearTimeout(spinClaim.timeoutHandle);
+  spinClaim = null;
+  if (spinEntryTimeoutHandle) clearTimeout(spinEntryTimeoutHandle);
+  spinEntryTimeoutHandle = null;
+  if (channel) await channel.send('🛑 Spin giveaway cancelled.').catch(() => {});
+}
+
+async function startSpinFlow(channel, prize, entrySeconds, spinRounds, imageUrl) {
+  if (spinConfig && spinConfig.active) {
+    return channel.send('A spin giveaway is already running — use `/spin-cancel` to stop it first.');
+  }
+  spinConfig = { prize, entrySeconds, spinRounds, imageUrl, channelId: channel.id, active: true };
+  spinParticipants = new Set();
+  await beginSpinCountdown(channel);
+}
+
+async function beginSpinCountdown(channel) {
+  if (!spinConfig || !spinConfig.active) return;
+
+  await channel.send(`@here 🎰 **${spinConfig.prize}** spin giveaway is about to start!`);
+  const countdownMsg = await channel.send('Spin will start in 3...');
+  await new Promise((r) => setTimeout(r, 1000));
+  await countdownMsg.edit('Spin will start in 2...').catch(() => {});
+  await new Promise((r) => setTimeout(r, 1000));
+  await countdownMsg.edit('Spin will start in 1...').catch(() => {});
+  await new Promise((r) => setTimeout(r, 1000));
+  await countdownMsg.edit('🚨 Enter fast!').catch(() => {});
+
+  const embed = new EmbedBuilder()
+    .setColor(0xffb020)
+    .setTitle('🎰 Spin Giveaway!')
+    .setDescription(
+      `**Prize:** ${spinConfig.prize}\n**Entries close in:** ${spinConfig.entrySeconds} second(s)\n\nClick the button below to enter!`
+    );
+  if (spinConfig.imageUrl) embed.setImage(spinConfig.imageUrl);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('spin_join').setLabel('🎉 Join').setStyle(ButtonStyle.Success)
+  );
+
+  await channel.send({ embeds: [embed], components: [row] });
+
+  spinEntryTimeoutHandle = setTimeout(() => runSpinShuffle(channel), spinConfig.entrySeconds * 1000);
+}
+
+async function runSpinShuffle(channel) {
+  if (!spinConfig || !spinConfig.active) return;
+
+  const pool = Array.from(spinParticipants);
+  if (pool.length === 0) {
+    await channel.send(`No entries for **${spinConfig.prize}** 🥲. Spin giveaway cancelled.`);
+    spinConfig = null;
+    return;
+  }
+
+  const winnerId = pool[Math.floor(Math.random() * pool.length)];
+  const rounds = spinConfig.spinRounds || 8;
+
+  const slotMsg = await channel.send('🎰 | ⬛ | ⬛ | ⬛ |');
+  for (let i = 0; i < rounds; i++) {
+    const r1 = pool[Math.floor(Math.random() * pool.length)];
+    const r2 = pool[Math.floor(Math.random() * pool.length)];
+    const r3 = pool[Math.floor(Math.random() * pool.length)];
+    await slotMsg
+      .edit(`🎰 | <@${r1}> | <@${r2}> | <@${r3}> |`)
+      .catch(() => {});
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  await slotMsg.edit(`🎰 | <@${winnerId}> | <@${winnerId}> | <@${winnerId}> | 🎉 WINNER!`).catch(() => {});
+
+  const claimRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('claim_open').setLabel('✅ Open Ticket').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('claim_noopen').setLabel('❌ Not Open Ticket').setStyle(ButtonStyle.Danger)
+  );
+
+  const claimEmbed = new EmbedBuilder()
+    .setColor(0x3fb950)
+    .setTitle('🎉 You won!')
+    .setDescription(
+      `<@${winnerId}> you won **${spinConfig.prize}**!\n\nClick **Open Ticket** to claim your prize. You have **1 minute** to respond, otherwise the spin will restart automatically.`
+    );
+
+  const claimMsg = await channel.send({ content: `<@${winnerId}>`, embeds: [claimEmbed], components: [claimRow] });
+
+  spinClaim = { winnerId, resolved: false };
+  spinClaim.timeoutHandle = setTimeout(async () => {
+    if (spinClaim && !spinClaim.resolved) {
+      spinClaim.resolved = true;
+      await claimMsg.edit({ components: [] }).catch(() => {});
+      await channel.send(`⏱️ <@${winnerId}> did not respond in time. Restarting the spin giveaway automatically...`);
+      spinParticipants = new Set();
+      spinClaim = null;
+      await beginSpinCountdown(channel);
+    }
+  }, 60000);
+}
 
 // ---------- WARNING HELPER ----------
 async function issueWarning(member, reason, channel) {
@@ -55,7 +200,7 @@ async function issueWarning(member, reason, channel) {
   }
 }
 
-// ---------- TICKET CREATION HELPER (used by support tickets and prize claims) ----------
+// ---------- TICKET CREATION HELPER ----------
 async function createTicketChannel(guild, user, { namePrefix = 'ticket', openingMessage }) {
   const safeName = `${namePrefix}-${user.username}`.toLowerCase().slice(0, 90);
   const existing = guild.channels.cache.find((c) => c.name === safeName);
@@ -118,98 +263,6 @@ async function postTradingNews() {
   }
 }
 
-// ---------- GIVEAWAY: start entries ----------
-async function startGiveaway(channel, prize, seconds) {
-  if (currentGiveaway) {
-    return channel.send('A giveaway is already running — wait for it to finish before starting a new one.');
-  }
-
-  const embed = new EmbedBuilder()
-    .setColor(0xffb020)
-    .setTitle('🎉 Giveaway!')
-    .setDescription(`**Prize:** ${prize}\n**Entries close in:** ${seconds} second(s)\n\nClick the button below to enter!`);
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('giveaway_join').setLabel('🎉 Join').setStyle(ButtonStyle.Success)
-  );
-
-  const sent = await channel.send({ embeds: [embed], components: [row] });
-
-  currentGiveaway = {
-    prize,
-    participants: new Set(),
-    excluded: new Set(),
-    channelId: channel.id,
-    messageId: sent.id,
-  };
-
-  currentGiveaway.entryTimeoutHandle = setTimeout(() => {
-    runSpin(channel);
-  }, seconds * 1000);
-}
-
-// ---------- SPIN: pick a winner from current giveaway's participants ----------
-async function runSpin(channel) {
-  if (!currentGiveaway) {
-    return channel.send('There is no active giveaway to spin right now. Start one with `/giveaway` first.');
-  }
-
-  if (currentGiveaway.entryTimeoutHandle) clearTimeout(currentGiveaway.entryTimeoutHandle);
-
-  const pool = Array.from(currentGiveaway.participants).filter((id) => !currentGiveaway.excluded.has(id));
-
-  if (pool.length === 0) {
-    const prize = currentGiveaway.prize;
-    currentGiveaway = null;
-    return channel.send(`No eligible entries left for **${prize}** 🥲. Start a new giveaway with \`/giveaway\`.`);
-  }
-
-  const winnerId = pool[Math.floor(Math.random() * pool.length)];
-
-  const spinMsg = await channel.send('🎡 Spinning the wheel...');
-  const spinRounds = Math.min(10, pool.length * 2);
-  for (let i = 0; i < spinRounds; i++) {
-    const randomId = pool[Math.floor(Math.random() * pool.length)];
-    await spinMsg.edit(`🎡 Spinning... <@${randomId}>`).catch(() => {});
-    await new Promise((r) => setTimeout(r, 450));
-  }
-  await spinMsg.edit(`🎡 Landed on... 🎉 <@${winnerId}>!`).catch(() => {});
-
-  const prize = currentGiveaway.prize;
-
-  const claimRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('claim_open').setLabel('✅ Open Ticket').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId('claim_noopen').setLabel('❌ Not Open Ticket').setStyle(ButtonStyle.Danger)
-  );
-
-  const claimEmbed = new EmbedBuilder()
-    .setColor(0x3fb950)
-    .setTitle('🎉 You won!')
-    .setDescription(
-      `<@${winnerId}> you won **${prize}**!\n\nClick **Open Ticket** to claim your prize. You have **1 minute** to respond, otherwise staff will re-spin.`
-    );
-
-  const claimMsg = await channel.send({ content: `<@${winnerId}>`, embeds: [claimEmbed], components: [claimRow] });
-
-  currentClaim = {
-    winnerId,
-    prize,
-    resolved: false,
-    channelId: channel.id,
-  };
-
-  currentClaim.resolveTimeoutHandle = setTimeout(async () => {
-    if (currentClaim && !currentClaim.resolved) {
-      currentClaim.resolved = true;
-      if (currentGiveaway) currentGiveaway.excluded.add(winnerId);
-      await claimMsg.edit({ components: [] }).catch(() => {});
-      await channel.send(
-        `⏱️ <@${winnerId}> did not respond in time. Staff can run \`/spin\` again to pick a new winner.`
-      );
-    }
-  }, 60000);
-}
-
 // ---------- READY ----------
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
@@ -222,7 +275,7 @@ client.once('clientReady', async () => {
     invitesCache.set(guild.id, codeUses);
   }
 
-  client.user.setActivity('Bulls & Chill 🐂', { type: 3 }); // Watching
+  client.user.setActivity('Bulls & Chill 🐂', { type: 3 });
 
   postTradingNews();
   setInterval(postTradingNews, NEWS_INTERVAL_MINUTES * 60000);
@@ -270,7 +323,7 @@ client.on('inviteCreate', async (invite) => {
   invitesCache.set(invite.guild.id, codeUses);
 });
 
-// ---------- SHARED COMMAND LOGIC ----------
+// ---------- SHARED HELPERS ----------
 function isStaffMember(member) {
   return (
     member.permissions.has(PermissionsBitField.Flags.Administrator) ||
@@ -332,8 +385,9 @@ function buildHelpEmbed() {
     .addFields(
       { name: '/verify-panel', value: 'Posts the verify button (staff)' },
       { name: '/ticket-panel', value: 'Posts the open-ticket button (staff)' },
-      { name: '/giveaway <prize> [seconds]', value: 'Starts a giveaway — entries stay open for the given seconds (default 15) (staff)' },
-      { name: '/spin', value: 'Spins the wheel early among current giveaway entries and picks a winner (staff)' },
+      { name: '/giveaway <prize> [seconds] [image]', value: 'Simple giveaway — plain winner announcement (staff)' },
+      { name: '/spin <prize> [seconds] [spins] [image]', value: 'Full spin giveaway with countdown, slot-style shuffle, and prize claim (staff)' },
+      { name: '/spin-cancel', value: 'Stops an active spin giveaway loop (staff)' },
       { name: '/invites [user]', value: 'Checks invite count' },
       { name: '/kick <user> [reason]', value: 'Kicks a member (staff)' },
       { name: '/ban <user> [reason]', value: 'Bans a member (staff)' },
@@ -368,15 +422,27 @@ client.on('interactionCreate', async (interaction) => {
     if (!isMod) return interaction.reply({ content: 'Only staff can use this command.', ephemeral: true });
     const prize = interaction.options.getString('prize');
     const seconds = interaction.options.getInteger('seconds') || 15;
+    const image = interaction.options.getAttachment('image');
     await interaction.reply({ content: 'Giveaway started ✅', ephemeral: true });
-    await startGiveaway(channel, prize, seconds);
+    await startNormalGiveaway(channel, prize, seconds, image ? image.url : null);
     return;
   }
 
   if (commandName === 'spin') {
     if (!isMod) return interaction.reply({ content: 'Only staff can use this command.', ephemeral: true });
-    await interaction.reply({ content: 'Spinning now...', ephemeral: true });
-    await runSpin(channel);
+    const prize = interaction.options.getString('prize');
+    const seconds = interaction.options.getInteger('seconds') || 15;
+    const spins = interaction.options.getInteger('spins') || 8;
+    const image = interaction.options.getAttachment('image');
+    await interaction.reply({ content: 'Spin giveaway started ✅', ephemeral: true });
+    await startSpinFlow(channel, prize, seconds, spins, image ? image.url : null);
+    return;
+  }
+
+  if (commandName === 'spin-cancel') {
+    if (!isMod) return interaction.reply({ content: 'Only staff can use this command.', ephemeral: true });
+    await interaction.reply({ content: 'Spin giveaway cancelled ✅', ephemeral: true });
+    await stopSpin(channel);
     return;
   }
 
@@ -464,11 +530,9 @@ client.on('interactionCreate', async (interaction) => {
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton()) return;
 
-  // VERIFY BUTTON
   if (interaction.customId === 'verify_button') {
     const role = interaction.guild.roles.cache.get(process.env.VERIFIED_ROLE_ID);
     if (!role) return interaction.reply({ content: 'Verified role is not set up.', ephemeral: true });
-
     if (interaction.member.roles.cache.has(role.id)) {
       return interaction.reply({ content: 'You are already verified ✅', ephemeral: true });
     }
@@ -476,7 +540,6 @@ client.on('interactionCreate', async (interaction) => {
     return interaction.reply({ content: 'Verified! You can now see all the channels 🎉', ephemeral: true });
   }
 
-  // OPEN TICKET BUTTON (general support)
   if (interaction.customId === 'open_ticket') {
     const { channel, alreadyExisted } = await createTicketChannel(interaction.guild, interaction.user, {
       namePrefix: 'ticket',
@@ -488,65 +551,86 @@ client.on('interactionCreate', async (interaction) => {
     return interaction.reply({ content: `Ticket created: ${channel}`, ephemeral: true });
   }
 
-  // CLOSE TICKET BUTTON
   if (interaction.customId === 'close_ticket') {
     await interaction.reply('Closing this ticket in 5 seconds...');
     setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
     return;
   }
 
-  // GIVEAWAY JOIN BUTTON
+  // NORMAL GIVEAWAY JOIN
   if (interaction.customId === 'giveaway_join') {
-    if (!currentGiveaway) {
+    if (!normalGiveaway) {
       return interaction.reply({ content: 'This giveaway is no longer active.', ephemeral: true });
     }
-    if (currentGiveaway.participants.has(interaction.user.id)) {
-      currentGiveaway.participants.delete(interaction.user.id);
+    if (normalGiveaway.participants.has(interaction.user.id)) {
+      normalGiveaway.participants.delete(interaction.user.id);
       return interaction.reply({ content: 'Your entry has been removed.', ephemeral: true });
     }
-    currentGiveaway.participants.add(interaction.user.id);
+    normalGiveaway.participants.add(interaction.user.id);
     return interaction.reply({ content: 'You are entered! Good luck 🎉', ephemeral: true });
   }
 
-  // CLAIM: OPEN TICKET
+  // SPIN GIVEAWAY JOIN
+  if (interaction.customId === 'spin_join') {
+    if (!spinConfig || !spinConfig.active) {
+      return interaction.reply({ content: 'This spin giveaway is no longer active.', ephemeral: true });
+    }
+    if (spinParticipants.has(interaction.user.id)) {
+      spinParticipants.delete(interaction.user.id);
+      return interaction.reply({ content: 'Your entry has been removed.', ephemeral: true });
+    }
+    spinParticipants.add(interaction.user.id);
+    return interaction.reply({ content: 'You are entered! Good luck 🎉', ephemeral: true });
+  }
+
+  // CLAIM: OPEN TICKET (spin system only)
   if (interaction.customId === 'claim_open') {
-    if (!currentClaim || currentClaim.resolved) {
+    if (!spinClaim || spinClaim.resolved) {
       return interaction.reply({ content: 'This prize claim is no longer active.', ephemeral: true });
     }
-    if (interaction.user.id !== currentClaim.winnerId) {
+    if (interaction.user.id !== spinClaim.winnerId) {
       return interaction.reply({ content: 'Only the winner can respond to this.', ephemeral: true });
     }
 
-    currentClaim.resolved = true;
-    if (currentClaim.resolveTimeoutHandle) clearTimeout(currentClaim.resolveTimeoutHandle);
+    spinClaim.resolved = true;
+    if (spinClaim.timeoutHandle) clearTimeout(spinClaim.timeoutHandle);
 
     const { channel, alreadyExisted } = await createTicketChannel(interaction.guild, interaction.user, {
       namePrefix: 'claim',
-      openingMessage: `${interaction.user} congrats on winning **${currentClaim.prize}**! Staff will process your prize here shortly.`,
+      openingMessage: `${interaction.user} congrats on winning **${spinConfig.prize}**! Staff will process your prize here shortly.`,
     });
 
     await interaction.update({ components: [] }).catch(() => {});
+    spinConfig = null; // spin loop ends successfully
+    spinParticipants = new Set();
+    spinClaim = null;
+
     return interaction.followUp({
       content: alreadyExisted ? `You already have a claim ticket open: ${channel}` : `Your claim ticket has been created: ${channel}`,
       ephemeral: true,
     });
   }
 
-  // CLAIM: NOT OPEN TICKET
+  // CLAIM: NOT OPEN TICKET (spin system only) -> auto-restart
   if (interaction.customId === 'claim_noopen') {
-    if (!currentClaim || currentClaim.resolved) {
+    if (!spinClaim || spinClaim.resolved) {
       return interaction.reply({ content: 'This prize claim is no longer active.', ephemeral: true });
     }
-    if (interaction.user.id !== currentClaim.winnerId) {
+    if (interaction.user.id !== spinClaim.winnerId) {
       return interaction.reply({ content: 'Only the winner can respond to this.', ephemeral: true });
     }
 
-    currentClaim.resolved = true;
-    if (currentClaim.resolveTimeoutHandle) clearTimeout(currentClaim.resolveTimeoutHandle);
-    if (currentGiveaway) currentGiveaway.excluded.add(interaction.user.id);
+    spinClaim.resolved = true;
+    if (spinClaim.timeoutHandle) clearTimeout(spinClaim.timeoutHandle);
 
     await interaction.update({ components: [] }).catch(() => {});
-    return interaction.followUp('Okay, no ticket will be opened. Staff can run `/spin` again to pick a new winner.');
+    await interaction.followUp('Okay, no ticket will be opened. Restarting the spin giveaway automatically...');
+
+    const channel = interaction.channel;
+    spinParticipants = new Set();
+    spinClaim = null;
+    await beginSpinCountdown(channel);
+    return;
   }
 });
 
@@ -555,7 +639,7 @@ client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
 
   const isModAuthor = isStaffMember(message.member);
-  if (isModAuthor) return; // never auto-warn staff
+  if (isModAuthor) return;
 
   const lower = message.content.toLowerCase();
 
@@ -577,7 +661,7 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-// ---------- LEGACY PREFIX COMMANDS (backup, in case slash commands are still propagating) ----------
+// ---------- LEGACY PREFIX COMMANDS (backup) ----------
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
   if (!message.content.startsWith(PREFIX)) return;
@@ -585,6 +669,7 @@ client.on('messageCreate', async (message) => {
   const args = message.content.slice(PREFIX.length).trim().split(/ +/);
   const command = args.shift().toLowerCase();
   const isMod = isStaffMember(message.member);
+  const attachedImage = message.attachments.first()?.url || null;
 
   if (command === 'verify-panel') {
     if (!isMod) return message.reply('Only staff can use this command.');
@@ -599,13 +684,20 @@ client.on('messageCreate', async (message) => {
   if (command === 'giveaway') {
     if (!isMod) return message.reply('Only staff can use this command.');
     const prize = args.join(' ');
-    if (!prize) return message.reply('Usage: `!giveaway <prize>`');
-    return startGiveaway(message.channel, prize, 15);
+    if (!prize) return message.reply('Usage: `!giveaway <prize>` (attach an image to include it)');
+    return startNormalGiveaway(message.channel, prize, 15, attachedImage);
   }
 
   if (command === 'spin') {
     if (!isMod) return message.reply('Only staff can use this command.');
-    return runSpin(message.channel);
+    const prize = args.join(' ');
+    if (!prize) return message.reply('Usage: `!spin <prize>` (attach an image to include it)');
+    return startSpinFlow(message.channel, prize, 15, 8, attachedImage);
+  }
+
+  if (command === 'spin-cancel') {
+    if (!isMod) return message.reply('Only staff can use this command.');
+    return stopSpin(message.channel);
   }
 
   if (command === 'invites') {
@@ -684,3 +776,4 @@ client.on('messageCreate', async (message) => {
 });
 
 client.login(process.env.BOT_TOKEN);
+
